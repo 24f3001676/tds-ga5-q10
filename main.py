@@ -120,7 +120,8 @@ def _check_version_and_media():
             return _error_response(415, "UNSUPPORTED_MEDIA_TYPE", "Unsupported Content-Type")
     return None
 
-def _task_response(task: dict, status=200):
+def _message_send_response(task: dict, status=200):
+    """POST /message:send returns {"task": Task}."""
     clean = _clean_task(task)
     body = {"task": clean}
     raw = json.dumps(body, ensure_ascii=False)
@@ -130,7 +131,18 @@ def _task_response(task: dict, status=200):
     resp.headers["A2A-Version"] = "1.0"
     return resp
 
+def _direct_task_response(task: dict, status=200):
+    """GET /tasks/{id} and POST /tasks/{id}:cancel return Task directly."""
+    clean = _clean_task(task)
+    raw = json.dumps(clean, ensure_ascii=False)
+    if len(raw.encode("utf-8")) > 512 * 1024:
+        return _error_response(413, "RESPONSE_TOO_LARGE", "Response exceeds 512 KiB limit")
+    resp = Response(raw, status=status, content_type=A2A_MEDIA)
+    resp.headers["A2A-Version"] = "1.0"
+    return resp
+
 def _tasks_list_response(tasks: list[dict]):
+    """GET /tasks returns {"tasks": [Task, ...]}."""
     body = {"tasks": tasks}
     raw = json.dumps(body, ensure_ascii=False)
     resp = Response(raw, status=200, content_type=A2A_MEDIA)
@@ -455,7 +467,7 @@ def message_send():
             existing_task = _tasks.get(existing_task_id) if existing_task_id else None
             if existing_task:
                 if idem_entry.get("msg_hash", "") == msg_hash:
-                    return _task_response(existing_task)
+                    return _message_send_response(existing_task)
                 return _error_response(409, "IDEMPOTENCY_CONFLICT", "Same messageId, different content")
 
     if task_id_in:
@@ -523,7 +535,7 @@ def _handle_initial(principal, body, msg, parts, idem_key, msg_hash):
         _idempotency[idem_key] = {"task_id": task_id, "msg_hash": msg_hash}
         _user_tasks.setdefault(principal, set()).add(task_id)
 
-    return _task_response(task)
+    return _message_send_response(task)
 
 def _handle_continuation(principal, body, msg, task_id_in, context_id_in, idem_key, msg_hash):
     with _lock:
@@ -582,7 +594,7 @@ def _handle_continuation(principal, body, msg, task_id_in, context_id_in, idem_k
         task["status"] = {"state": "TASK_STATE_COMPLETED"}
         _idempotency[idem_key] = {"task_id": task_id_in, "msg_hash": msg_hash}
 
-    return _task_response(task)
+    return _message_send_response(task)
 
 # ---- GET /tasks/{id} ----
 @app.route("/tasks/<task_id>", methods=["GET"])
@@ -599,7 +611,7 @@ def get_task(task_id):
         task = _tasks.get(task_id)
         if not task or task["_principal"] != principal:
             return _error_response(404, "TASK_NOT_FOUND", "Task not found")
-        return _task_response(task)
+        return _direct_task_response(task)
 
 # ---- GET /tasks ----
 @app.route("/tasks", methods=["GET"])
@@ -635,7 +647,7 @@ def cancel_task(task_id):
         if task["status"]["state"] in TERMINAL_STATES:
             return _error_response(409, "TASK_NOT_CANCELABLE", f"Task is already {task['status']['state']}")
         task["status"] = {"state": "TASK_STATE_CANCELED"}
-        return _task_response(task)
+        return _direct_task_response(task)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT)
