@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: a2a-invoice-agent
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn --bind 0.0.0.0:$PORT --workers 2 --threads 4 --timeout 45 app:app
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.0"
+      - key: BASE_URL
+        sync: false
+      - key: AIPIPE_TOKEN
+        sync: false
+      - key: AI_MODEL
+        value: "openai/gpt-4.1-nano"
+      - key: AI_ENDPOINT
+        value: "https://aipipe.org/openrouter/v1/responses"
