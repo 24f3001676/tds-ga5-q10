@@ -4,7 +4,6 @@ import hashlib
 import json
 import os
 import threading
-import time
 import uuid
 from copy import deepcopy
 
@@ -14,7 +13,11 @@ from flask import Flask, Response, jsonify, request
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-BASE_URL = os.environ.get("BASE_URL", "https://localhost/a2a/").rstrip("/") + "/"
+# BASE_URL should be the full base path including trailing slash
+# e.g., "https://example.com/a2a/" or "https://example.com/"
+RAW_BASE = os.environ.get("BASE_URL", "https://localhost/a2a/").rstrip("/")
+BASE_URL = RAW_BASE + "/" if RAW_BASE else "https://localhost/a2a/"
+
 AIPIPE_TOKEN = os.environ.get("AIPIPE_TOKEN", "")
 AI_MODEL = os.environ.get("AI_MODEL", "openai/gpt-4.1-nano")
 AI_ENDPOINT = os.environ.get(
@@ -36,21 +39,25 @@ RECEIPT_MEDIA = "application/vnd.ga5.invoice-action-receipts+json"
 RESULT_MEDIA = "application/vnd.ga5.invoice-action-results+json"
 A2A_MEDIA = "application/a2a+json"
 
+# Determine if we're using a sub-path or root
+# If BASE_URL ends with /a2a/, routes go under /a2a/
+# If BASE_URL is just the domain, routes go at root
+USE_SUBPATH = BASE_URL.rstrip("/").endswith("/a2a")
+
 # ---------------------------------------------------------------------------
 # Storage (in-memory, thread-safe)
 # ---------------------------------------------------------------------------
 _lock = threading.Lock()
-_tasks: dict[str, dict] = {}          # task_id -> Task dict
-_idempotency: dict[str, str] = {}     # idem_key -> task_id
-_user_tasks: dict[str, set] = {}      # principal -> set of task_ids
-_decision_cache: dict[str, dict] = {} # package_hash -> decision dict
+_tasks: dict[str, dict] = {}
+_idempotency: dict[str, str] = {}
+_user_tasks: dict[str, set] = {}
+_decision_cache: dict[str, dict] = {}
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 def _canonical_json(obj) -> str:
-    """Deterministic JSON for hashing (sorted keys, no whitespace)."""
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
@@ -96,7 +103,6 @@ def _error_response(status: int, reason: str, message: str = ""):
 
 
 def _check_auth():
-    """Return principal or an error Response."""
     p = _get_principal()
     if not p:
         return _error_response(401, "UNAUTHENTICATED", "Missing Bearer token")
@@ -104,7 +110,6 @@ def _check_auth():
 
 
 def _check_version_and_media():
-    """Validate A2A-Version and Content-Type. Return error Response or None."""
     ver = request.headers.get("A2A-Version", "")
     if ver and ver != "1.0":
         return _error_response(400, "INVALID_VERSION", "Only A2A-Version 1.0 supported")
@@ -132,7 +137,6 @@ def _tasks_list_response(tasks: list[dict]):
 # ---------------------------------------------------------------------------
 
 def _build_ai_prompt(packages: list[dict], policy_revision: str) -> str:
-    """Build a single prompt covering all packages in the batch."""
     lines = [
         "You are an invoice processing agent. For each invoice package below, "
         "choose exactly ONE action from: settle_invoice, request_approval, "
@@ -165,7 +169,6 @@ def _build_ai_prompt(packages: list[dict], policy_revision: str) -> str:
 
 
 def _call_ai(prompt: str) -> str:
-    """Call the AI endpoint and return raw text."""
     if not AIPIPE_TOKEN:
         raise RuntimeError("AIPIPE_TOKEN not set")
 
@@ -174,14 +177,12 @@ def _call_ai(prompt: str) -> str:
         "Content-Type": "application/json",
     }
 
-    # Try OpenAI Responses API format first
     if "openrouter" in AI_ENDPOINT or "openai" in AI_ENDPOINT.lower():
         payload = {
             "model": AI_MODEL,
             "input": prompt,
         }
     else:
-        # Gemini format
         payload = {
             "contents": [{"parts": [{"text": prompt}]}]
         }
@@ -190,7 +191,6 @@ def _call_ai(prompt: str) -> str:
     resp.raise_for_status()
     data = resp.json()
 
-    # Extract text from OpenAI Responses format
     if "output" in data:
         parts = []
         for item in data.get("output", []):
@@ -199,11 +199,9 @@ def _call_ai(prompt: str) -> str:
                     parts.append(c["text"])
         return "\n".join(parts)
 
-    # Extract text from Chat Completions format
     if "choices" in data:
         return data["choices"][0].get("message", {}).get("content", "")
 
-    # Extract text from Gemini format
     if "candidates" in data:
         parts = data["candidates"][0].get("content", {}).get("parts", [])
         return "\n".join(p.get("text", "") for p in parts)
@@ -212,8 +210,6 @@ def _call_ai(prompt: str) -> str:
 
 
 def _parse_ai_response(raw: str, packages: list[dict]) -> list[dict]:
-    """Parse AI output into structured decisions."""
-    # Find JSON array in the response
     text = raw.strip()
     start = text.find("[")
     end = text.rfind("]") + 1
@@ -222,13 +218,17 @@ def _parse_ai_response(raw: str, packages: list[dict]) -> list[dict]:
     arr = json.loads(text[start:end])
 
     results = []
-    pkg_map = {p.get("packageId"): p for p in packages}
+    seen_pids = set()
 
     for item in arr:
         pid = item.get("packageId", "")
+        if pid in seen_pids:
+            continue
+        seen_pids.add(pid)
+        
         action = item.get("action", "")
         if action not in VALID_ACTIONS:
-            action = "open_exception"  # safe fallback
+            action = "open_exception"
 
         vendor = item.get("vendorName", "")
         inv_num = item.get("invoiceNumber", "")
@@ -237,11 +237,9 @@ def _parse_ai_response(raw: str, packages: list[dict]) -> list[dict]:
         refs = item.get("evidenceRefs", [])
         rationale = item.get("rationale", "")
 
-        # Ensure at least 3 evidence refs
         while len(refs) < 3:
             refs.append(f"[ref-{pid}-{len(refs)}]")
 
-        # Ensure rationale length
         if len(rationale) < 60:
             rationale = (
                 f"Action {action} chosen for package {pid}. "
@@ -262,11 +260,10 @@ def _parse_ai_response(raw: str, packages: list[dict]) -> list[dict]:
             "rationale": rationale,
         })
 
-    # Fill missing packages with open_exception
-    seen = {r["packageId"] for r in results}
-    for pkg in packages:
-        pid = pkg.get("packageId", "")
-        if pid not in seen:
+    # Fill missing packages
+    pkg_ids = {p.get("packageId") for p in packages}
+    for pid in pkg_ids:
+        if pid not in seen_pids:
             results.append({
                 "packageId": pid,
                 "action": "open_exception",
@@ -282,7 +279,6 @@ def _parse_ai_response(raw: str, packages: list[dict]) -> list[dict]:
 
 
 def _decide_packages(packages: list[dict], policy_revision: str) -> list[dict]:
-    """Decide actions for packages, using cache where possible."""
     decisions = []
     uncached = []
     uncached_indices = []
@@ -307,8 +303,7 @@ def _decide_packages(packages: list[dict], policy_revision: str) -> list[dict]:
 
         for idx, decision in zip(uncached_indices, parsed):
             decisions[idx] = decision
-            h = _hash_package(uncached[idx - uncached_indices[0]] if uncached_indices else uncached[0])
-            # Cache by original package hash
+            ph = _hash_package(uncached[idx - uncached_indices[0]] if uncached_indices else uncached[0])
             for j, ui in enumerate(uncached_indices):
                 if ui == idx:
                     ph = _hash_package(uncached[j])
@@ -327,7 +322,7 @@ app = Flask(__name__)
 
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok"})
+    return jsonify({"status": "ok", "base_url": BASE_URL, "use_subpath": USE_SUBPATH})
 
 
 # ---- Agent Card (public, no auth) ----
@@ -369,15 +364,21 @@ def agent_card():
     return Response(json.dumps(card), status=200, content_type="application/json")
 
 
+# ---- Route prefix helper ----
+def _prefix(path: str) -> str:
+    """Add /a2a prefix if using subpath, otherwise return path as-is."""
+    if USE_SUBPATH:
+        return f"/a2a{path}"
+    return path
+
+
 # ---- POST /message:send ----
-@app.route("/a2a/message:send", methods=["POST"])
+@app.route(_prefix("/message:send"), methods=["POST"])
 def message_send():
-    # Auth
     principal = _check_auth()
     if isinstance(principal, Response):
         return principal
 
-    # Version & media
     err = _check_version_and_media()
     if err:
         return err
@@ -391,12 +392,11 @@ def message_send():
         return _error_response(400, "INVALID_REQUEST", "Missing message")
 
     message_id = msg.get("messageId", "")
-    role = msg.get("role", "")
-    parts = msg.get("parts", [])
     task_id_in = msg.get("taskId", "")
     context_id_in = msg.get("contextId", "")
+    parts = msg.get("parts", [])
 
-    # ---- Idempotency check ----
+    # Idempotency
     idem_key = f"{principal}:{message_id}"
     msg_hash = _hash_message(msg)
 
@@ -405,7 +405,6 @@ def message_send():
         if existing_task_id:
             existing_task = _tasks.get(existing_task_id)
             if existing_task:
-                # Check semantic match
                 stored_hash = existing_task.get("_msg_hash", "")
                 if stored_hash == msg_hash:
                     return _task_response(existing_task)
@@ -415,17 +414,15 @@ def message_send():
                         "Same messageId with different content"
                     )
 
-    # ---- Continuation (result) message ----
+    # Continuation
     if task_id_in:
         return _handle_continuation(principal, body, msg, task_id_in, context_id_in, idem_key, msg_hash)
 
-    # ---- Initial batch message ----
+    # Initial batch
     return _handle_initial(principal, body, msg, parts, idem_key, msg_hash)
 
 
 def _handle_initial(principal, body, msg, parts, idem_key, msg_hash):
-    """Process an initial invoice batch message."""
-    # Find the batch part
     batch_data = None
     for part in parts:
         if part.get("mediaType") == BATCH_MEDIA:
@@ -442,17 +439,14 @@ def _handle_initial(principal, body, msg, parts, idem_key, msg_hash):
     if not packages:
         return _error_response(400, "INVALID_REQUEST", "Empty packages")
 
-    # Generate IDs
     task_id = _new_id("task-")
     context_id = _new_id("ctx-")
 
-    # Decide actions via AI (with caching)
     try:
         decisions = _decide_packages(packages, policy_rev)
     except Exception as e:
         return _error_response(500, "AI_ERROR", str(e)[:200])
 
-    # Build proposals
     proposals = []
     seen_pids = set()
     for d in decisions:
@@ -506,12 +500,10 @@ def _handle_initial(principal, body, msg, parts, idem_key, msg_hash):
         _idempotency[idem_key] = task_id
         _user_tasks.setdefault(principal, set()).add(task_id)
 
-    # Return clean task (strip internal fields)
     return _task_response(_clean_task(task))
 
 
 def _handle_continuation(principal, body, msg, task_id_in, context_id_in, idem_key, msg_hash):
-    """Handle a result continuation message."""
     with _lock:
         task = _tasks.get(task_id_in)
         if not task:
@@ -526,7 +518,6 @@ def _handle_continuation(principal, body, msg, task_id_in, context_id_in, idem_k
         if context_id_in and task["contextId"] != context_id_in:
             return _error_response(400, "CONTEXT_MISMATCH")
 
-    # Parse results
     result_data = None
     for part in msg.get("parts", []):
         if part.get("mediaType") == RESULT_MEDIA:
@@ -573,7 +564,6 @@ def _handle_continuation(principal, body, msg, task_id_in, context_id_in, idem_k
                 "evidenceRefs": prop["evidenceRefs"],
             })
 
-        # Build receipt artifact
         receipt_artifact = {
             "artifactId": _new_id("art-"),
             "name": "invoice-action-receipts",
@@ -591,15 +581,13 @@ def _handle_continuation(principal, body, msg, task_id_in, context_id_in, idem_k
         task["artifacts"].append(receipt_artifact)
         task["history"].append(msg)
         task["status"] = {"state": "TASK_STATE_COMPLETED"}
-
-        # Store before responding
         _idempotency[idem_key] = task_id_in
 
     return _task_response(_clean_task(task))
 
 
 # ---- GET /tasks/{id} ----
-@app.route("/a2a/tasks/<task_id>", methods=["GET"])
+@app.route(_prefix("/tasks/<task_id>"), methods=["GET"])
 def get_task(task_id):
     principal = _check_auth()
     if isinstance(principal, Response):
@@ -617,7 +605,7 @@ def get_task(task_id):
 
 
 # ---- GET /tasks ----
-@app.route("/a2a/tasks", methods=["GET"])
+@app.route(_prefix("/tasks"), methods=["GET"])
 def list_tasks():
     principal = _check_auth()
     if isinstance(principal, Response):
@@ -634,7 +622,7 @@ def list_tasks():
 
 
 # ---- POST /tasks/{id}:cancel ----
-@app.route("/a2a/tasks/<task_id>:cancel", methods=["POST"])
+@app.route(_prefix("/tasks/<task_id>:cancel"), methods=["POST"])
 def cancel_task(task_id):
     principal = _check_auth()
     if isinstance(principal, Response):
@@ -661,9 +649,7 @@ def cancel_task(task_id):
 
 
 def _clean_task(task: dict) -> dict:
-    """Remove internal fields before returning."""
-    t = {k: v for k, v in task.items() if not k.startswith("_")}
-    return t
+    return {k: v for k, v in task.items() if not k.startswith("_")}
 
 
 # ---------------------------------------------------------------------------
