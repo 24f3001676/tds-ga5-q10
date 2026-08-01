@@ -58,7 +58,8 @@ TERMINAL_STATES = {
 # ---------------------------------------------------------------------------
 _lock = threading.Lock()
 _tasks: dict[str, dict] = {}
-_idempotency: dict[str, str] = {}
+# _idempotency maps "principal:messageId" -> {"task_id": str, "msg_hash": str}
+_idempotency: dict[str, dict] = {}
 _user_tasks: dict[str, set] = {}
 _decision_cache: dict[str, dict] = {}
 
@@ -448,11 +449,12 @@ def message_send():
     msg_hash = _hash_message(msg)
 
     with _lock:
-        existing_task_id = _idempotency.get(idem_key)
-        if existing_task_id:
-            existing_task = _tasks.get(existing_task_id)
+        idem_entry = _idempotency.get(idem_key)
+        if idem_entry:
+            existing_task_id = idem_entry.get("task_id")
+            existing_task = _tasks.get(existing_task_id) if existing_task_id else None
             if existing_task:
-                if existing_task.get("_msg_hash", "") == msg_hash:
+                if idem_entry.get("msg_hash", "") == msg_hash:
                     return _task_response(existing_task)
                 return _error_response(409, "IDEMPOTENCY_CONFLICT", "Same messageId, different content")
 
@@ -512,14 +514,13 @@ def _handle_initial(principal, body, msg, parts, idem_key, msg_hash):
         }],
         "history": [msg],
         "_principal": principal,
-        "_msg_hash": msg_hash,
         "_batch_id": batch_id,
         "_proposals": {p["packageId"]: p for p in proposals},
     }
 
     with _lock:
         _tasks[task_id] = task
-        _idempotency[idem_key] = task_id
+        _idempotency[idem_key] = {"task_id": task_id, "msg_hash": msg_hash}
         _user_tasks.setdefault(principal, set()).add(task_id)
 
     return _task_response(task)
@@ -550,11 +551,15 @@ def _handle_continuation(principal, body, msg, task_id_in, context_id_in, idem_k
         if task["_batch_id"] != batch_id:
             return _error_response(400, "BATCH_MISMATCH", "Batch ID mismatch")
 
+        # Validate each proposal matching
         executions = []
         for r in results:
             pid = r.get("packageId", "")
             prop = task["_proposals"].get(pid)
-            if prop and prop["actionId"] == r.get("actionId") and prop["action"] == r.get("action") and r.get("outcome") == "ACCEPTED":
+            if not prop or prop["actionId"] != r.get("actionId") or prop["action"] != r.get("action"):
+                return _error_response(400, "PROPOSAL_MISMATCH", f"Continuation result for package {pid} does not match proposal")
+
+            if r.get("outcome") == "ACCEPTED":
                 executions.append({
                     "packageId": pid,
                     "actionId": r["actionId"],
@@ -575,7 +580,7 @@ def _handle_continuation(principal, body, msg, task_id_in, context_id_in, idem_k
         })
         task["history"].append(msg)
         task["status"] = {"state": "TASK_STATE_COMPLETED"}
-        _idempotency[idem_key] = task_id_in
+        _idempotency[idem_key] = {"task_id": task_id_in, "msg_hash": msg_hash}
 
     return _task_response(task)
 
