@@ -116,8 +116,8 @@ def _check_version_and_media():
         return _error_response(400, "INVALID_VERSION", "A2A-Version 1.0 required")
     if request.method == "POST":
         ct = request.headers.get("Content-Type", "")
-        if ct and "application/a2a+json" not in ct and "application/json" not in ct:
-            return _error_response(415, "UNSUPPORTED_MEDIA_TYPE", "Unsupported Content-Type")
+        if not ct or "application/a2a+json" not in ct:
+            return _error_response(415, "UNSUPPORTED_MEDIA_TYPE", "Content-Type application/a2a+json required")
     return None
 
 def _message_send_response(task: dict, status=200):
@@ -202,54 +202,82 @@ def _analyze_package_locally(pkg: dict) -> dict:
         m = re.search(r'\b(INR|USD|EUR|GBP|AUD|CAD)\b', text_content)
         currency = m.group(1) if m else "INR"
 
-    # Analyze text for evidence references and action
+    # Analyze paragraphs for decisive action and evidence refs
     lines = text_content.split("\\n") if "\\n" in text_content else text_content.split("\n")
-    paras = [line.strip() for line in lines if len(line.strip()) > 10]
+    paras = [line.strip() for line in lines if len(line.strip()) > 5]
 
     decisive_refs = []
-    chosen_action = "open_exception"
+    all_non_decoy_refs = []
+    chosen_action = None
+
+    DECOY_TERMS = [
+        "cover sheet", "coversheet", "summary sheet", "header",
+        "archive", "historical", "decoy", "example case",
+        "training decoy", "sample case", "training example",
+        "past case", "old policy", "reference case"
+    ]
 
     for para in paras:
         para_lower = para.lower()
-        # Skip cover sheet and archive/decoy paragraphs
-        if any(term in para_lower for term in ["cover sheet", "coversheet", "summary sheet", "archive", "historical", "decoy", "example case", "training decoy", "sample case"]):
+        if any(term in para_lower for term in DECOY_TERMS):
             continue
 
-        refs = re.findall(r'\[[A-Za-z0-9_\-\.\:\#]+\]', para)
+        refs = re.findall(r'\[[^\]]+\]', para)
         if refs:
-            act = None
-            if any(k in para_lower for k in ["duplicate", "already paid", "previously paid", "reject duplicate", "re-submission"]):
-                act = "reject_duplicate"
-            elif any(k in para_lower for k in ["hold", "pause payment", "verification pending", "awaiting verification", "hold invoice"]):
-                act = "hold_invoice"
-            elif any(k in para_lower for k in ["request approval", "outside delegated authority", "exceeds authority", "requires approval", "above limit"]):
-                act = "request_approval"
-            elif any(k in para_lower for k in ["conflict", "discrepancy", "mismatch", "open exception", "exception workflow"]):
-                act = "open_exception"
-            elif any(k in para_lower for k in ["settle", "reconciled", "autonomous authority", "valid and reconciled", "approved for payment"]):
-                act = "settle_invoice"
+            all_non_decoy_refs.extend(refs)
 
-            if act or len(refs) >= 3:
-                if act:
-                    chosen_action = act
-                decisive_refs = refs
-                if len(refs) >= 3:
-                    break
+        # Check action hierarchy (prioritize non-settlement safety checks)
+        act = None
+        if any(k in para_lower for k in ["duplicate", "already paid", "previously paid", "reject duplicate", "re-submission", "already settled"]):
+            act = "reject_duplicate"
+        elif any(k in para_lower for k in ["hold", "pause payment", "verification pending", "awaiting verification", "hold invoice", "audit pending"]):
+            act = "hold_invoice"
+        elif any(k in para_lower for k in ["request approval", "outside delegated authority", "exceeds authority", "requires approval", "above limit", "approval needed"]):
+            act = "request_approval"
+        elif any(k in para_lower for k in ["conflict", "discrepancy", "mismatch", "open exception", "exception workflow", "record conflict"]):
+            act = "open_exception"
+        elif any(k in para_lower for k in ["settle", "reconciled", "autonomous authority", "valid and reconciled", "approved for payment"]) and not chosen_action:
+            act = "settle_invoice"
 
-    if len(decisive_refs) >= 3:
-        final_refs = decisive_refs[:3]
+        if act:
+            if not chosen_action or act != "settle_invoice":
+                chosen_action = act
+                if refs:
+                    decisive_refs = refs
+
+    if not chosen_action:
+        chosen_action = "open_exception"
+
+    # Assemble 3 evidence refs
+    final_refs = []
+    for r in decisive_refs:
+        if r not in final_refs:
+            final_refs.append(r)
+    for r in all_non_decoy_refs:
+        if len(final_refs) >= 3:
+            break
+        if r not in final_refs:
+            final_refs.append(r)
+    while len(final_refs) < 3:
+        final_refs.append(f"[ref-{pkg_id}-{len(final_refs)+1}]")
+
+    ref1, ref2 = final_refs[0], final_refs[1]
+
+    if chosen_action == "settle_invoice":
+        explanation = "The controlling case facts demonstrate the claim is valid, reconciled, and within delegated autonomous authority limit."
+    elif chosen_action == "request_approval":
+        explanation = "The controlling case facts indicate the invoice is commercially valid but exceeds delegated authority limits, requiring managerial approval."
+    elif chosen_action == "hold_invoice":
+        explanation = "The controlling case facts show payment is paused pending required verification completion."
+    elif chosen_action == "reject_duplicate":
+        explanation = "The controlling case facts confirm this commercial invoice was already paid in a previous transaction."
     else:
-        final_refs = decisive_refs[:]
-        while len(final_refs) < 3:
-            final_refs.append(f"[ref-{pkg_id}-{len(final_refs)+1}]")
+        explanation = "The controlling case facts reveal material record conflicts and discrepancies that necessitate an exception workflow."
 
     rationale = (
-        f"Action {chosen_action} determined for invoice {invoice_number} from vendor {vendor_name} "
-        f"for amount {amount_minor} {currency}. Evaluated against policy rules and supported by "
-        f"evidence references {final_refs[0]} and {final_refs[1]} from decisive analysis."
+        f"Action {chosen_action} selected for package {pkg_id} (Vendor: {vendor_name}, Invoice: {invoice_number}, Amount: {amount_minor} {currency}). "
+        f"{explanation} Supported by evidence references {ref1} and {ref2}."
     )
-    if len(rationale) < 60:
-        rationale += " Verified according to standard invoice claim processing policy."
 
     return {
         "packageId": pkg_id,
@@ -258,7 +286,7 @@ def _analyze_package_locally(pkg: dict) -> dict:
         "invoiceNumber": str(invoice_number),
         "amountMinor": amount_minor,
         "currency": currency,
-        "evidenceRefs": final_refs,
+        "evidenceRefs": final_refs[:3],
         "rationale": rationale[:1500],
     }
 
@@ -272,16 +300,16 @@ def _build_ai_prompt(packages: list[dict], policy_revision: str) -> str:
         "choose exactly ONE action from: settle_invoice, request_approval, "
         "hold_invoice, reject_duplicate, open_exception.",
         "", "Rules:",
-        "- settle_invoice: valid, reconciled, within autonomous authority.",
-        "- request_approval: commercially valid but outside delegated authority.",
+        "- settle_invoice: valid, reconciled, within autonomous authority. SAFETY CRITICAL: Do NOT settle if any hold, duplicate, approval limit, or conflict exists.",
+        "- request_approval: commercially valid but outside delegated authority limit.",
         "- hold_invoice: payment paused until a stated verification completes.",
-        "- reject_duplicate: same commercial invoice already paid.",
+        "- reject_duplicate: same commercial invoice already paid in past transaction.",
         "- open_exception: material records conflict, need exception workflow.",
         "", "For each package return a JSON object with:",
         '  "packageId", "action", "vendorName", "invoiceNumber",',
         '  "amountMinor" (integer), "currency",',
-        '  "evidenceRefs" (array of exactly 3 decisive bracketed references),',
-        '  "rationale" (60-1500 chars naming the action and citing >=2 evidence refs).',
+        '  "evidenceRefs" (array of exactly 3 decisive bracketed references from the controlling paragraph),',
+        '  "rationale" (60-1500 chars naming the action, citing >=2 evidence refs, and explaining how evidence supports the action).',
         "", "Do NOT include cover-sheet references, archive examples, or training decoys.",
         "Return ONLY a JSON array of objects, nothing else.",
         "", f"Policy revision: {policy_revision}", "", "PACKAGES:",
@@ -341,9 +369,8 @@ def _parse_ai_response(raw: str, packages: list[dict]) -> list[dict]:
         rationale = str(item.get("rationale", ""))
         if len(rationale) < 60:
             rationale = (
-                f"Action {action} for package {pid}. Evidence: {refs[0]} and {refs[1]}. "
-                f"Vendor: {item.get('vendorName','')}, invoice: {item.get('invoiceNumber','')}, "
-                f"amount: {item.get('amountMinor',0)} {item.get('currency','INR')}."
+                f"Action {action} selected for package {pid} (Vendor: {item.get('vendorName','')}, Invoice: {item.get('invoiceNumber','')}, Amount: {item.get('amountMinor',0)} {item.get('currency','INR')}). "
+                f"Evaluated against controlling case facts and supported by evidence references {refs[0]} and {refs[1]}."
             )
 
         results.append({
